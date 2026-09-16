@@ -1,0 +1,299 @@
+name: Xenofilx Note 4 BS Gradient
+
+# Reproduces Supplementary Table S6 (0-99% BS-seq composition gradient, 43 cells) from the
+# published `fallingstar10/otter-data` fixtures. Each cell runs three pipelines: modern
+# `xenofilx` (strand-aware bisulfite NM), the `xdxtools` prototype (Picard `SetNmMdAndUqTags`
+# with `IS_BISULFITE_SEQUENCE=true` + R `XenofilteR`), and the unpatched conventional control.
+# The two patched arms carry the recorded expectations and reproduce the table; the control has
+# none, and is reported as a negative control showing why the bisulfite patch is load-bearing.
+#
+# Scope policy:
+#   push / pull_request          -> representative slice (3 cells) so the gradient stays a fast gate
+#   workflow_dispatch (full)     -> all 43 cells, sharded across parallel jobs
+#
+# The fixture contract (labels, sizes, SHA-256) lives in `benchmark/note4/mixture-cells.json`;
+# the expected aggregate metrics live in `benchmark/note4/table-s6-gradient.tsv`.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      full_sweep:
+        description: 'Run all 43 gradient cells instead of the 3-cell representative slice'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  FIXTURE_BASE_URL: https://huggingface.co/datasets/fallingstar10/otter-data/resolve/0b0c627cb0fdb2394577bb9c6cdc969646ed668f
+  ENVA_COMMIT: bdea477885a90dec16874351a9f572feb8298a55
+  XENOFILTER_COMMIT: de0bbe4c706766702b0fe15a676893639f96d50d
+  HG19_URL: https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_19/GRCh37.p13.genome.fa.gz
+  HG19_FA_SHA256: b22e74cdd8b90a1228474ce31739aa76d71be55735f93de1471e3886790b9256
+  HG19_FA_SIZE: '3234842113'
+  MM10_URL: https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M25/GRCm38.primary_assembly.genome.fa.gz
+  MM10_FA_SHA256: 767f48e8ae5bda117ad519fb694cbf7e24f161bf094c274bbbcd16e52aedf802
+  MM10_FA_SIZE: '2776387546'
+
+# A push to the same ref supersedes any run still in flight for this workflow. The group is
+# per workflow and per ref, so the newest commit is always fully covered and other branches
+# are untouched. Kept in sync across the repository's workflows.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Plan the gradient scope
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.scope.outputs.cells }}
+      shards: ${{ steps.scope.outputs.shards }}
+    steps:
+      - name: Checkout xenofilx
+        uses: actions/checkout@v4
+
+      - name: Resolve the requested cell scope
+        id: scope
+        env:
+          FULL_SWEEP: ${{ github.event_name == 'workflow_dispatch' && inputs.full_sweep || 'false' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, pathlib, math
+          contract = json.loads(pathlib.Path('benchmark/note4/mixture-cells.json').read_text())
+          labels = [cell['label'] for cell in contract['cells']]
+          if os.environ.get('FULL_SWEEP', 'false').lower() == 'true':
+              selected = labels
+              shard_count = 6
+          else:
+              selected = ['human0p001-replicate1', 'human0p5-replicate1', 'human0p99-replicate1']
+              shard_count = len(selected)
+          print(f"cells={json.dumps(selected)}")
+          print(f"shards={json.dumps(list(range(1, shard_count + 1)))}")
+          PY
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "Xenofilx Note 4 — gradient scope planning" \
+            --checked "Resolves which cells of the Table S6 gradient this run evaluates, reads the cell contract from benchmark/note4/mixture-cells.json, and publishes the cell list plus the shard count for the matrix job." \
+            --check "Scope resolved from the committed contract|cell list produced|see step log|${gate_result}" \
+            --check "Shard plan produced|shard indices emitted|see step log|${gate_result}" \
+            --metric "Trigger|${{ github.event_name }}" \
+            --metric "Full sweep requested|${{ github.event_name == 'workflow_dispatch' && inputs.full_sweep || 'false' }}" \
+            --limit "Planning only: this job evaluates no cells and produces no scientific evidence. It exists so the matrix size is decided from the contract rather than duplicated in the workflow." \
+            --note "A push runs a three-cell representative slice; workflow_dispatch with full_sweep covers all 43 cells across six shards."
+
+  gradient:
+    name: Gradient shard ${{ matrix.shard }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - name: Checkout xenofilx
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned enva
+        uses: actions/checkout@v4
+        with:
+          repository: otterlab-bio/enva
+          ref: ${{ env.ENVA_COMMIT }}
+          path: .ci/enva
+
+      - name: Checkout pinned XenofilteR source
+        uses: actions/checkout@v4
+        with:
+          repository: PeeperLab/XenofilteR
+          ref: ${{ env.XENOFILTER_COMMIT }}
+          path: .ci/XenofilteR
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare evidence directory
+        run: mkdir -p ci-artifacts/{reference,evidence,logs,fixture-cache}
+
+      - name: Build xenofilx and enva
+        run: |
+          set -euo pipefail
+          go build -buildvcs=false -o ci-artifacts/xenofilx ./cmd/xenofilx
+          (cd .ci/enva && cargo build --release --locked --bin enva) 2>&1 | tee ci-artifacts/logs/enva-build.log
+
+      - name: Create the analysis environment through enva
+        env:
+          RATTLER_CACHE_DIR: ${{ runner.temp }}/rattler-cache
+        run: |
+          set -euo pipefail
+          mkdir -p "$RATTLER_CACHE_DIR"
+          cat > ci-artifacts/gradient-analysis.yaml <<'YAML'
+          channels:
+            - conda-forge
+            - bioconda
+          dependencies:
+            - samtools=1.15.1
+            - picard=3.4.0
+            - r-base=4.3
+            - bioconductor-biocparallel
+            - bioconductor-genomicalignments
+            - bioconductor-genomeinfodbdata
+            - bioconductor-genomicranges
+            - bioconductor-iranges
+            - bioconductor-s4vectors
+            - bioconductor-rsamtools
+            - r-futile.logger
+            - r-jsonlite
+          YAML
+          .ci/enva/target/release/enva create \
+            --yaml ci-artifacts/gradient-analysis.yaml \
+            --name gradient-analysis \
+            --force \
+            --output summary \
+            2>&1 | tee ci-artifacts/logs/enva-create.log
+
+      - name: Install XenofilteR from the pinned source
+        run: |
+          set -euo pipefail
+          bash scripts/gate6/install-xenofilter.sh \
+            "$GITHUB_WORKSPACE/.ci/XenofilteR" \
+            gradient-analysis \
+            2>&1 | tee ci-artifacts/logs/xenofilter-install.log
+
+      - name: Acquire and verify reference FASTAs
+        run: |
+          set -euo pipefail
+          fetch_reference () {
+            local label="$1" url="$2" fa_sha="$3" fa_size="$4"
+            curl --fail --location --silent --show-error --retry 5 "$url" \
+              | gunzip -c > "ci-artifacts/reference/${label}.fa"
+            printf '%s  %s\n' "$fa_sha" "ci-artifacts/reference/${label}.fa" | sha256sum --check -
+            test "$(stat -c %s "ci-artifacts/reference/${label}.fa")" = "$fa_size"
+          }
+          fetch_reference hg19 "$HG19_URL" "$HG19_FA_SHA256" "$HG19_FA_SIZE"
+          fetch_reference mm10 "$MM10_URL" "$MM10_FA_SHA256" "$MM10_FA_SIZE"
+
+      - name: Run the assigned gradient cells
+        env:
+          SELECTED_CELLS: ${{ needs.plan.outputs.cells }}
+        run: |
+          set -euo pipefail
+          shard=${{ matrix.shard }}
+          shard_count=${{ strategy.job-total }}
+          python3 - "$shard" "$shard_count" <<'PY' > ci-artifacts/assigned-cells.txt
+          import json, os, sys
+          selected = json.loads(os.environ["SELECTED_CELLS"])
+          shard, shard_count = int(sys.argv[1]), int(sys.argv[2])
+          step = -(-len(selected) // shard_count)
+          for label in selected[(shard - 1) * step : shard * step]:
+              print(label)
+          PY
+          while read -r cell; do
+            [ -z "$cell" ] && continue
+            python3 scripts/gate6/run-note4-gradient-cell.py \
+              --contract benchmark/note4/mixture-cells.json \
+              --cell "$cell" \
+              --fixture-base-url "$FIXTURE_BASE_URL" \
+              --reference-directory ci-artifacts/reference \
+              --xenofilx ci-artifacts/xenofilx \
+              --enva .ci/enva/target/release/enva \
+              --environment gradient-analysis \
+              --work-directory ci-artifacts/evidence \
+              2>&1 | tee "ci-artifacts/logs/cell-${cell}.log"
+          done < ci-artifacts/assigned-cells.txt
+
+      - name: Compare the gradient with the recorded per-cell metrics
+        run: |
+          set -euo pipefail
+          python3 scripts/gate6/compare-note4-gradient.py \
+            --metrics-directory ci-artifacts/evidence \
+            --expected benchmark/note4/per-cell-expected-s6.json \
+            --tolerance 0.5 \
+            --large-deviation 2.0 \
+            --report ci-artifacts/gradient-comparison.json \
+            2>&1 | tee ci-artifacts/logs/gradient-comparison.log
+
+      - name: Upload gradient evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenofilx-note4-gradient-shard-${{ matrix.shard }}
+          path: |
+            ci-artifacts/evidence/
+            ci-artifacts/logs/
+            ci-artifacts/gradient-comparison.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          cells="$(tr '\n' ' ' < ci-artifacts/assigned-cells.txt 2>/dev/null || echo '-')"
+          # Read the comparator's real schema: it reports evaluated_cell_count and a
+          # metric_outcomes tally, not a `status_counts` map.
+          bash scripts/ci/summary-field.sh \
+            ci-artifacts/gradient-comparison.json#evaluated_cell_count \
+            ci-artifacts/gradient-comparison.json#metric_outcomes.within_range \
+            ci-artifacts/gradient-comparison.json#metric_outcomes.deviation \
+            ci-artifacts/gradient-comparison.json#metric_outcomes.large_deviation \
+            ci-artifacts/gradient-comparison.json#tolerance_percentage_points \
+            > ci-artifacts/summary-fields.txt 2>/dev/null || true
+          field() { rg -N "^$1=" ci-artifacts/summary-fields.txt 2>/dev/null | head -n 1 | cut -d= -f2- || echo "-"; }
+          evaluated="$(find ci-artifacts/evidence -name source-performance.json 2>/dev/null | wc -l | tr -d ' ')"
+          outcome_note="within $(field within_range), deviation $(field deviation), large $(field large_deviation)"
+          # One row per evaluated cell carrying its measured graft recall and host specificity
+          # beside the recorded value, so the briefing states the gradient's results rather than
+          # only how many metrics were compared. Values come from the comparison report, which
+          # holds numbers; the step log holds prose.
+          declare -a comparison_rows=()
+          while IFS= read -r row; do
+            [ -n "${row}" ] && comparison_rows+=(--check "${row}")
+          done < <(python3 scripts/gate6/note4-briefing-rows.py \
+            --report ci-artifacts/gradient-comparison.json \
+            --metrics modern_recall legacy_recall modern_spec legacy_spec 2>/dev/null || true)
+          # The unpatched control is a negative control, not a reported arm: it has no recorded
+          # per-cell expectation, so these rows carry measured values only. Graft recall and PPV
+          # collapse to ~0 pp while host specificity is unaffected.
+          declare -a control_rows=()
+          while IFS= read -r row; do
+            [ -n "${row}" ] && control_rows+=(--check "${row}")
+          done < <(python3 scripts/gate6/note4-briefing-rows.py \
+            --report ci-artifacts/gradient-comparison.json \
+            --metrics conventional_recall conventional_spec conventional_ppv \
+            --label-suffix " (unpatched control)" 2>/dev/null || true)
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "Xenofilx Note 4 — bisulfite gradient (Table S6)" \
+            --scope "shard ${{ matrix.shard }}" \
+            --checked "Runs each assigned cell of the 0-99% bisulfite composition gradient through the modern xenofilx selection and the legacy Picard plus XenofilteR arm on the same fixtures, then compares the per-cell metrics against the recorded values, alongside the unpatched conventional control. Each row reports measured graft recall and host specificity, beside the recorded value for the two reported arms." \
+            --check "Cells evaluated by this shard|all assigned cells|${evaluated} produced source-performance.json|${gate_result}" \
+            --check "Cells compared by the report|all evaluated cells|$(field evaluated_cell_count)|-" \
+            --check "Metrics at tolerance $(field tolerance_percentage_points) pp|reported, never enforced|${outcome_note}|-" \
+            "${comparison_rows[@]}" \
+            "${control_rows[@]}" \
+            --metric "Assigned cells|${cells}" \
+            --metric "Fixture revision|0b0c627c (immutable)" \
+            --artifact "xenofilx-note4-gradient-shard-${{ matrix.shard }}" \
+            --limit "The unpatched control has no recorded per-cell expectation, so its rows state measured values and are marked as outside the recorded contract rather than compared against it. It is reported because its collapse is the evidence that the bisulfite NM recalculation is load-bearing, and it stays out of the Table S6 numbers." \
+            --limit "Recall and specificity differences are reported rather than enforced: a single replicate can deviate from the published three-replicate mean, so the shard records the spread and keeps the evidence. Only a missing or structurally invalid evidence set fails the job." \
+            --note "A representative three-cell slice runs on push; workflow_dispatch with full_sweep covers all 43 cells."

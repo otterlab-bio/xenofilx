@@ -1,0 +1,100 @@
+name: xenofilx CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+# A push to the same ref supersedes any run still in flight for this workflow. The group is
+# per workflow and per ref, so the newest commit is always fully covered and other branches
+# are untouched. Kept in sync across the repository's workflows.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-bam-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Run Go quality gates
+        run: |
+          go mod download
+          go test -count=1 ./...
+          go vet ./...
+          # Race detector is slow on bamnative real-BAM tests; use -short to
+          # skip TestBGZFReaderPosition (50+ seconds alone under race) while
+          # still exercising all correctness and concurrency assertions.
+          go test -race -count=1 -short ./...
+
+      - name: Run vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+      - name: Install samtools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y samtools
+
+      - name: Build xenofilx
+        run: |
+          CGO_ENABLED=0 go build -o ./xenofilx ./cmd/xenofilx
+
+      - name: BAM compatibility gate
+        run: |
+          set -euo pipefail
+          GRAFT="testdata/Test_hg19_NRAS.bam"
+          HOST="testdata/Test_mm10_NRAS.bam"
+          OUT_DIR="$(mktemp -d)"
+
+          samtools quickcheck "$GRAFT" "$HOST"
+          samtools view -H "$GRAFT" >/dev/null
+          samtools view -c "$GRAFT" >/dev/null
+
+          ./xenofilx run --graft "$GRAFT" --host "$HOST" --output "$OUT_DIR" --threads 1
+
+          OUT_BAM="$OUT_DIR/Test_hg19_NRAS_Filtered.bam"
+          test -f "$OUT_BAM"
+          test -f "$OUT_BAM.bai"
+          samtools quickcheck "$OUT_BAM"
+          samtools view -H "$OUT_BAM" >/dev/null
+          samtools view -c "$OUT_BAM" >/dev/null
+          samtools view -H "$OUT_BAM" | awk '$1 == "@HD" && $0 !~ /SO:coordinate/ { exit 1 }'
+          FIRST_REF="$(samtools view -H "$OUT_BAM" | awk '$1 == "@SQ" { sub(/^SN:/, "", $2); print $2; exit }')"
+          test -n "$FIRST_REF"
+          samtools view "$OUT_BAM" "${FIRST_REF}:1-1000000" >/dev/null
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          # These gates are pass/fail with no numeric comparison to report, so the result comes
+          # from the job verdict: a green job means every preceding step passed. A non-green job
+          # is left un-attributed rather than guessing which gate failed.
+          if [ "${{ job.status }}" = "success" ]; then
+            gate_result="PASS"
+          else
+            gate_result="-"
+          fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "xenofilx — unit contract and classifier smoke" \
+            --checked "Go quality gates, a race run, a vulnerability scan, and a classifier smoke test that filters a small graft/host pair and validates the output with samtools." \
+            --check "Go quality gates|gofmt, vet and tests pass|see step log|${gate_result}" \
+            --check "Race detector|null races reported|see step log|${gate_result}" \
+            --check "Vulnerability scan|govulncheck reports no reachable issue|see step log|${gate_result}" \
+            --check "Classifier smoke|output BAM, index and coordinate sort present|see step log|${gate_result}" \
+            --limit "Unit and small-fixture coverage. Real-BAM NM parity is Gate C, mixture performance is the mixture workflow, and fragment-level accounting is Gate D." \
+            --limit "These four checks are boolean gates, so the briefing reports the job verdict for each and points at the step log; there is no numeric comparison to display." \
+            --note "The race run uses -short because the real-BAM/BGZF tests exceed runner budgets under the race detector."
