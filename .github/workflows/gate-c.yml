@@ -20,8 +20,8 @@ permissions:
 env:
   FIXTURE_BASE_URL: https://huggingface.co/datasets/fallingstar10/otter-data/resolve/0b0c627cb0fdb2394577bb9c6cdc969646ed668f
   GATE_C_RECORD_LIMIT: '200000'
-  ENVA_COMMIT: bdea477885a90dec16874351a9f572feb8298a55
-  BAMDRIVER_COMMIT: 56d3f05f569bed00ce7d2d37bf636af7112a3b63
+  ENVA_COMMIT: 3559ddf7a5b46d3aee78c0f1a6222850ecbc8fa7
+  BAMDRIVER_COMMIT: 11c180fd8bb2c2a4cf4c9cd331aef32615e00e35
 
 # A push to the same ref supersedes any run still in flight for this workflow. The group is
 # per workflow and per ref, so the newest commit is always fully covered and other branches

@@ -3,7 +3,7 @@ module github.com/otterlab-bio/xenofilx
 go 1.23
 
 require (
-	github.com/otterlab-bio/bamdriver v0.1.2-0.20260902024548-6ab31d04c17d
+	github.com/otterlab-bio/bamdriver v1.0.0
 	github.com/spf13/cobra v1.8.0
 )
 
