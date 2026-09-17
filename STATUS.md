@@ -10,22 +10,20 @@
 ### 2. 核心算法实现 ✅
 - **编辑距离计算**: NM tag + CIGAR 插入(I) + 软剪裁(S)
 - **单端分类**: 比较两个参考基因组上的编辑距离
-- **双端分类**: 成对 reads 的平均分数比较
+- **双端分类**: 成对 reads 的分数求和比较（graft 的 forward+reverse 总分 vs host 的总分）
 - **配置管理**: 参数验证和默认值
 
-### 3. BAM I/O 纯 Go 实现 ✅
-- `internal/bamnative/` - 纯 Go 实现的 BAM 读写
-- 支持 BAM 压缩/解压缩
-- 支持 BAM 索引构建
-- 支持 BAM 排序检查
+### 3. BAM I/O（共享库委托）✅
+- `internal/bamnative/` 是对共享库 `github.com/otterlab-bio/bamdriver/pkg/bamnative` 的薄封装（re-export），BAM 读写/压缩/索引/排序检查由 bamdriver 提供
+- 纯 Go 实现位于 bamdriver，本仓库不持有独立拷贝
 
 ### 4. NM Tag 计算模块 ✅
-- `internal/bamnative/nmtag.go` - NM 计算
+- 由 bamdriver 的 `pkg/bamnative/nmtag.go` 提供
 - 支持与参考基因组比对计算 NM
-- 支持 bisulfite 模式 (C→T 不计入 mismatch)
+- 支持 bisulfite 模式：按 `XG` 上下文识别 CT（C→T）与 GA（G→A）两种转换，不计入 mismatch；无 `XG` 时按方向 fallback
 
 ### 5. FASTA 索引功能 ✅
-- `internal/bamnative/faidx.go` - FASTA 索引
+- 由 bamdriver 的 `pkg/bamnative/faidx.go` 提供
 - 自动检测 gzip 压缩
 - 自动生成 .fai 索引文件
 - LRU 缓存优化内存使用
@@ -99,7 +97,7 @@ xenofilx/
 
 ## 性能考虑
 
-- **纯 Go 实现**: 无外部依赖
+- **纯 Go 实现**: 无外部工具依赖（BAM/FASTA 基础能力来自共享库 bamdriver）
 - **内存使用**: 比 R 版本低
 - **流式处理**: FASTA 按需加载 + LRU 缓存
 - **并发**: 使用 goroutines 实现多样本并行处理

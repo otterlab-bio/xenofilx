@@ -85,13 +85,39 @@ xenofilx run \
 | `--threads, -j` | Number of parallel workers. |
 | `--graft-ref`, `--host-ref` | FASTA references for NM recalculation. |
 | `--recalculate-nm` | Force reference-based NM recalculation. |
-| `--bisulfite` | Apply bisulfite-aware scoring rules. |
+| `--bisulfite` | Apply bisulfite-aware scoring rules (CT and GA conversion contexts via the `XG` tag). |
+| `--sort-memory` | Memory budget for external queryname sorting, e.g. `512M`, `8G`; default is `256M`. |
+| `--output-names, -w` | Explicit output file names, one per graft input. |
 
 ## Algorithm and output
 
-The score follows the XenofilteR-compatible contract of NM plus insertion and soft-clip contributions. Paired-end classification combines mate evidence and unmapped penalties, then applies the configured threshold. Output includes filtered BAM data and a results summary with graft-only, host-only, both, discarded, and threshold fields.
+The score follows the XenofilteR-compatible contract of NM plus insertion and
+soft-clip contributions. The configured threshold is an exclusive,
+per-graft-mate gate. When host alignments are present, a fragment is discarded
+before genome comparison if either graft mate score is greater than or equal
+to the threshold. Surviving fragments are classified by summing forward and
+reverse scores per genome (including unmapped penalties): the lower total
+wins, and equal totals are discarded. When the host pair has no alignments,
+the fragment is retained as graft when either graft mate is below the
+threshold; otherwise it is discarded. Output includes filtered BAM data and a
+results summary with graft-only, host-only, both, discarded, and threshold
+fields.
 
 Coordinate-sorted BAM inputs are expected. Missing BAM and FASTA indexes can be generated automatically. Secondary, supplementary, and unmapped records are not retained as eligible primary records; verify the paired-BAM contract before using `pairbam` downstream.
+
+## Diagnostic and benchmark CLIs
+
+`cmd/scoreaudit` audits classifier score decisions against evidence inputs.
+`cmd/sortbench` measures the shared BAM sort path and can verify output order:
+
+```bash
+go build -o sortbench ./cmd/sortbench
+sortbench --input input.bam --runs 3 --memory-limit-mb 256 --json
+# Optional profiles: --cpuprofile cpu.pprof --memprofile mem.pprof
+```
+
+Benchmark output is engineering evidence for the named fixture/environment, not
+an unrestricted throughput or memory claim.
 
 ## Development
 
